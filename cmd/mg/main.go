@@ -43,6 +43,7 @@ func main() {
 	cmdTimeout := flag.Int("cmd-timeout", 0, "Command timeout in seconds (scales all external command timeouts; default 30)")
 	agentRuntime := flag.String("agent", "", "Preferred agent runtime: claude, cursor, or codex (default: first on PATH — claude, then cursor, then codex)")
 	agentCmd := flag.String("agent-cmd", "", "Single executable (no arguments) to launch instead of the agent binary; the runtime's flags are still passed, and mg will not start if it is not executable (default: MG_AGENT_CMD env, or the runtime binary)")
+	agentMode := flag.String("agent-mode", "", "How a launches an agent: auto (a tmux split pane inside tmux, a foreground session otherwise), tmux, exec, or background (a Claude Code background session that outlives mg) (default: MG_AGENT_MODE env, or auto)")
 	themeFlag := flag.String("theme", "", "Color theme: auto, dark, or light (default: MG_THEME env or auto)")
 	noJev := flag.Bool("no-jev", false, "Disable the Jev judge for this run even when MG_JEV_API_KEY is set")
 	flag.Parse()
@@ -65,6 +66,13 @@ func main() {
 	// wrapper is exec'd in place of that runtime's binary, with its flags.
 	if *agentCmd != "" {
 		os.Setenv(agent.AgentCommandEnv, *agentCmd)
+	}
+
+	// --agent-mode sets MG_AGENT_MODE, the same env-based contract, read by
+	// internal/app when it builds the model. The value is validated below,
+	// before the TUI takes the terminal.
+	if *agentMode != "" {
+		os.Setenv(agent.AgentModeEnv, *agentMode)
 	}
 
 	// MG_CMD_TIMEOUT env var as alternative to --cmd-timeout flag
@@ -154,6 +162,12 @@ func main() {
 	// point a launch error can only surface as a toast, and only once someone
 	// presses a key that launches an agent.
 	if err := resolveAgentCmd(); err != nil {
+		fmt.Fprintf(os.Stderr, "mg: %v\n", err)
+		os.Exit(1)
+	}
+	// An unrecognised mode is refused here rather than ignored, so a typo in
+	// a launcher script cannot quietly leave mg dispatching the other way.
+	if _, err := agent.ConfiguredMode(); err != nil {
 		fmt.Fprintf(os.Stderr, "mg: %v\n", err)
 		os.Exit(1)
 	}

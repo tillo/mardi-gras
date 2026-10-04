@@ -47,6 +47,16 @@ func (m Model) updateBackground(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 		model, cmd = m.handleAgentStatus(msg)
 	case agentOutputMsg:
 		model, cmd = m.handleAgentOutput(msg)
+	case backgroundAgentsMsg:
+		model, cmd = m.handleBackgroundAgents(msg)
+	case backgroundLaunchedMsg:
+		model, cmd = m.handleBackgroundLaunched(msg)
+	case backgroundStoppedMsg:
+		model, cmd = m.handleBackgroundStopped(msg)
+	case backgroundDetachedMsg:
+		model, cmd = m.handleBackgroundDetached(msg)
+	case backgroundErrorMsg:
+		model, cmd = m.handleBackgroundError(msg)
 	case journalTickMsg:
 		model, cmd = m.handleJournalTick(msg)
 	case journalEnabledMsg:

@@ -76,14 +76,17 @@ type Model struct {
 	spinner       spinner.Model // branded loading spinner (shown until ready)
 	agentAvail    bool
 	agentRuntime  agent.Runtime
+	agentMode     agent.Mode // how `a` launches: auto, tmux, exec or background
 	projectDir    string
 	inTmux        bool
-	activeAgents  map[string]string   // issueID -> tmux window name
-	gtEnv         gastown.Env         // Gas Town environment, read once at startup
-	driver        gastown.Driver      // Orchestrator seam; GTDriver today (gt CLI)
-	townStatus    *gastown.TownStatus // Latest gt status, nil when unavailable
-	gasTown       views.GasTown       // Gas Town control surface panel
-	showGasTown   bool                // Whether the Gas Town panel replaces detail
+	activeAgents  map[string]string                  // issueID -> tmux window name
+	bgAvail       bool                               // the runtime can run background sessions
+	bgAgents      map[string]agent.BackgroundSession // issueID -> daemon-hosted session
+	gtEnv         gastown.Env                        // Gas Town environment, read once at startup
+	driver        gastown.Driver                     // Orchestrator seam; GTDriver today (gt CLI)
+	townStatus    *gastown.TownStatus                // Latest gt status, nil when unavailable
+	gasTown       views.GasTown                      // Gas Town control surface panel
+	showGasTown   bool                               // Whether the Gas Town panel replaces detail
 
 	// Toast notification
 	toast components.Toast
@@ -230,6 +233,14 @@ type Model struct {
 	captureWanted   bool
 	captureInFlight bool
 
+	// Single-flight gate and TTL for background session scans: bgScanInFlight
+	// keeps one `claude agents` at a time, bgScanAt holds the last one back
+	// for backgroundScanInterval, and bgScanned marks the first scan (which
+	// runs in every mode, so sessions started earlier still show up).
+	bgScanInFlight bool
+	bgScanAt       time.Time
+	bgScanned      bool
+
 	// townStatusErr is the last orchestrator status failure. It stops
 	// gasTownLoading() spinning forever on a backend that will never answer,
 	// and is cleared whenever a fresh poll starts or a poll succeeds.
@@ -302,6 +313,9 @@ func NewWithGuard(issues []data.Issue, source data.Source, blockingTypes map[str
 	watchPath := source.Path
 	pathExplicit := source.Explicit
 	projectDir := source.ProjectDir
+	// Resolved once: it decides whether mg watches the background session
+	// registry at all, and the watch is what costs a process launch.
+	bgAvail := agent.BackgroundSupported()
 
 	lastFileMod := time.Time{}
 	if watchPath != "" {
@@ -318,21 +332,26 @@ func NewWithGuard(issues []data.Issue, source data.Source, blockingTypes map[str
 	metaSchema := data.LoadMetadataSchema(projectDir)
 
 	m := Model{
-		issues:         issues,
-		groups:         groups,
-		activPane:      PaneParade,
-		watchPath:      watchPath,
-		pathExplicit:   pathExplicit,
-		lastFileMod:    lastFileMod,
-		blockingTypes:  blockingTypes,
-		excludeTypes:   f.ExcludeTypes,
-		excludeLabels:  f.ExcludeLabels,
-		filterInput:    ti,
-		agentAvail:     agent.Available(),
-		agentRuntime:   agent.DetectRuntime(),
-		projectDir:     projectDir,
-		inTmux:         agent.InTmux() && agent.TmuxAvailable(),
-		activeAgents:   make(map[string]string),
+		issues:        issues,
+		groups:        groups,
+		activPane:     PaneParade,
+		watchPath:     watchPath,
+		pathExplicit:  pathExplicit,
+		lastFileMod:   lastFileMod,
+		blockingTypes: blockingTypes,
+		excludeTypes:  f.ExcludeTypes,
+		excludeLabels: f.ExcludeLabels,
+		filterInput:   ti,
+		agentAvail:    agent.Available(),
+		agentRuntime:  agent.DetectRuntime(),
+		agentMode:     configuredAgentMode(),
+		projectDir:    projectDir,
+		inTmux:        agent.InTmux() && agent.TmuxAvailable(),
+		activeAgents:  make(map[string]string),
+		bgAvail:       bgAvail,
+		bgAgents:      make(map[string]agent.BackgroundSession),
+		// Init starts the first registry scan; this gates the ones after it.
+		bgScanInFlight: bgAvail,
 		gtEnv:          gtEnv,
 		driver:         gastown.SelectDriver(),
 		gtPollInFlight: gtEnv.Available || gastown.GCEnabled(), // Init() launches the first poll; gate subsequent ones
@@ -360,9 +379,19 @@ func (m Model) Init() tea.Cmd {
 	} else if m.inTmux {
 		agentPoll = pollTmuxAgentState
 	}
+	// The first background session scan is started directly, not through
+	// gatedPollBackgroundAgents: New sets its single-flight gate so the polls
+	// that follow Init cannot stack, which is also what makes that call a
+	// no-op here. It runs in every mode, so a session started before this mg
+	// — or by another client — is still found.
+	var bgPoll tea.Cmd
+	if m.bgAvail {
+		bgPoll = pollBackgroundAgents(m.projectDir)
+	}
 	cmds := []tea.Cmd{
 		m.refreshTimer(m.refresh.tickGen),
 		agentPoll,
+		bgPoll,
 	}
 	if !m.noAnimations {
 		cmds = append(cmds, headerShimmerCmd(), m.spinner.Tick)
@@ -2011,6 +2040,12 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			_ = agent.SelectAgentWindow(issue.ID)
 			return m, nil
 		}
+		// A background session is already running for this issue: the user
+		// means to get back to it, not to start a second agent on the same
+		// work. Checked before the orchestrator's sling for the same reason.
+		if session, ok := m.bgAgents[issue.ID]; ok {
+			return m, attachBackgroundCmd(session.ID)
+		}
 
 		if m.gtEnv.Available {
 			issueID := issue.ID
@@ -2030,6 +2065,13 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		// the multi-select and Gas City paths dispatched fine.
 		if !m.agentAvail {
 			return m, nil
+		}
+
+		// Background mode replaces both local paths below. The branches above
+		// still win: an orchestrator owns its agents' lifecycle, and a
+		// background session mg started here is not one of its polecats.
+		if m.agentMode.Background() {
+			return m, m.backgroundAgentCmd(issue)
 		}
 
 		deps := issue.EvaluateDependencies(m.detail.IssueMap, m.blockingTypes)
@@ -2056,10 +2098,25 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return agentFinishedMsg{err: err}
 		})
 
+	case "d":
+		// Dispatch straight to a background session, whatever the launch
+		// mode is. `a` is the mode's key; this one always means "start it on
+		// the daemon", which is what a client that may not stay connected —
+		// a phone — wants from a single keystroke.
+		if issue := m.parade.SelectedIssue; issue != nil {
+			return m, m.backgroundAgentCmd(issue)
+		}
+		return m, nil
+
 	case "A":
 		issue := m.parade.SelectedIssue
 		if issue == nil {
 			return m, nil
+		}
+		// A background session is mg's own: no orchestrator knows about it,
+		// so it is stopped here rather than unslung.
+		if session, ok := m.bgAgents[issue.ID]; ok {
+			return m, stopBackgroundCmd(issue.ID, session.ID)
 		}
 		if _, active := m.activeAgents[issue.ID]; !active {
 			return m, nil
@@ -3045,13 +3102,17 @@ func (m *Model) setActiveAgents(agents map[string]string) {
 	}
 }
 
-// capturable reports whether issueID has a live agent in a tmux pane mg can
-// read. Under an orchestrator the map holds agent names, not panes.
+// capturable reports whether issueID has a live agent mg can read output
+// from: a tmux pane it can capture. Background sessions are deliberately not
+// capturable — `claude logs` returns the session's raw terminal stream, which
+// is a differential repaint rather than lines of text, so the detail panel
+// reports a session's state instead of tailing it (see sessionLabels).
+// Under an orchestrator the agent map holds agent names, not panes.
 func (m Model) capturable(issueID string) bool {
 	return m.inTmux && agent.IsPaneID(m.activeAgents[issueID])
 }
 
-// agentOutputMsg carries the tail of an agent's tmux pane.
+// agentOutputMsg carries the tail of a tmux pane's output.
 type agentOutputMsg struct {
 	issueID string
 	lines   []string
@@ -3067,7 +3128,8 @@ func (m *Model) startAgentCapture() tea.Cmd {
 		return nil
 	}
 	m.captureInFlight = true
-	id, pane := sel.ID, m.activeAgents[sel.ID]
+	id := sel.ID
+	pane := m.activeAgents[sel.ID]
 	return func() tea.Msg {
 		return agentOutputMsg{issueID: id, lines: agent.CapturePane(pane, 15)}
 	}
@@ -3366,12 +3428,29 @@ func (m *Model) recomputeVelocity() {
 }
 
 // propagateAgentState pushes active agent info to all sub-views.
+//
+// The views ask one question — does this issue have an agent? — so panes and
+// background sessions are merged into the one map they read. The two stay
+// separate in the model, where the polls that fill them need to tell them
+// apart; only the display is shared. A pane wins a tie, being the agent the
+// user can see.
 func (m *Model) propagateAgentState() {
-	m.parade.ActiveAgents = m.activeAgents
+	agents := m.activeAgents
+	if len(m.bgAgents) > 0 {
+		agents = make(map[string]string, len(m.activeAgents)+len(m.bgAgents))
+		maps.Copy(agents, m.activeAgents)
+		for id, session := range m.bgAgents {
+			if _, ok := agents[id]; !ok {
+				agents[id] = session.ID
+			}
+		}
+	}
+	m.parade.ActiveAgents = agents
 	m.parade.TownStatus = m.townStatus
-	m.detail.ActiveAgents = m.activeAgents
+	m.detail.ActiveAgents = agents
+	m.detail.AgentLabels = m.sessionLabels()
 	m.detail.TownStatus = m.townStatus
-	m.header.AgentCount = len(m.activeAgents)
+	m.header.AgentCount = len(agents)
 	m.header.TownStatus = m.townStatus
 	m.header.GasTownAvailable = m.orchestratorAvailable()
 
@@ -3430,8 +3509,8 @@ func buildZombieIDs(status *gastown.TownStatus, orphanedIDs map[string]bool) map
 // It uses a single-flight gate to prevent overlapping gt status polls (gt status --json
 // takes ~9s, and this is called from 3 watcher handlers + 8 user-action handlers).
 func (m *Model) gatedPollAgentState() tea.Cmd {
+	var cmds []tea.Cmd
 	if m.orchestratorAvailable() {
-		var cmds []tea.Cmd
 		if !m.gtPollInFlight {
 			m.gtPollInFlight = true
 			// A fresh attempt clears the previous failure, so the panel returns
@@ -3443,15 +3522,22 @@ func (m *Model) gatedPollAgentState() tea.Cmd {
 		if cmd := m.gatedPollPatrolScan(); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
-		if len(cmds) > 0 {
-			return tea.Batch(cmds...)
-		}
+	} else if m.inTmux {
+		cmds = append(cmds, pollTmuxAgentState)
+	}
+	// Background sessions are mg's own, so they are followed in every
+	// arrangement — an orchestrator has never heard of them. Panes and the
+	// registry are independent sources, each with its own guard inside.
+	if cmd := m.gatedPollBackgroundAgents(); cmd != nil {
+		cmds = append(cmds, cmd)
+	}
+	switch len(cmds) {
+	case 0:
 		return nil
+	case 1:
+		return cmds[0]
 	}
-	if m.inTmux {
-		return pollTmuxAgentState
-	}
-	return nil
+	return tea.Batch(cmds...)
 }
 
 const gasTownTickInterval = 1 * time.Second

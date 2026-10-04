@@ -40,6 +40,10 @@ type Detail struct {
 	MetadataSchema *data.MetadataSchema
 	AgentOutput    []string // live captured lines from agent's tmux pane
 	AgentOutputID  string   // which issue the agent output belongs to
+	// AgentLabels names the issue's background agent, when it has one, in
+	// place of the generic "active" — a session mg cannot capture but can
+	// still say the state of.
+	AgentLabels map[string]string
 	// RecentChanges holds the displayed issue's records from the bd events
 	// journal, oldest first, for the ACTIVITY section.
 	RecentChanges []data.JournalRecord
@@ -316,12 +320,12 @@ func (d *Detail) renderContent() string {
 					}
 				} else {
 					lines = append(lines, d.row("Agent:", agentStyle.Render(
-						fmt.Sprintf("%s active", ui.SymAgent),
+						fmt.Sprintf("%s %s", ui.SymAgent, d.agentLabel(issue.ID)),
 					)))
 				}
 			} else {
 				lines = append(lines, d.row("Agent:", agentStyle.Render(
-					fmt.Sprintf("%s active", ui.SymAgent),
+					fmt.Sprintf("%s %s", ui.SymAgent, d.agentLabel(issue.ID)),
 				)))
 			}
 		}
@@ -762,6 +766,15 @@ func (d *Detail) renderComments() string {
 	}
 
 	return strings.Join(lines, "\n")
+}
+
+// agentLabel names the agent on an issue: a background session identifies
+// itself, everything else is the generic "active".
+func (d *Detail) agentLabel(issueID string) string {
+	if label := d.AgentLabels[issueID]; label != "" {
+		return label
+	}
+	return "active"
 }
 
 // renderAgentOutput renders live agent output captured from a tmux pane.
