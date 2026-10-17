@@ -5,11 +5,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
+
+	"github.com/matt-wright86/mardi-gras/internal/data"
 )
 
 // Mode selects how a launched agent runs. It is the value of --agent-mode /
@@ -146,7 +151,187 @@ func runtimeBinary(rt Runtime) (string, error) {
 	return filepath.Abs(p)
 }
 
-// LaunchBackground starts issueID's agent as a daemon-hosted background
+// sessionNameMax caps a background session's name, in runes. The agent view
+// widens its name column to the longest name and truncates past about 54
+// columns on its own; staying under that keeps the cut where mg puts it, after
+// the issue ID, instead of wherever the view's falls.
+const sessionNameMax = 48
+
+// sessionNameSep separates the issue ID from the scope label in a session
+// name. An issue ID never contains a space, so the first space ends it.
+const sessionNameSep = " · "
+
+// SessionName returns the name a background session for issue is started
+// with: mg-<issueID>, as for a tmux pane, followed by a short scope label so
+// sessions can be told apart in `claude agents`. The label is the issue's
+// title, or its type when the title is empty.
+//
+// The label is cut to keep the name within sessionNameMax. The ID is never
+// cut, since it is what ties the session back to the issue: an ID too long to
+// leave room for a label gets no label.
+func SessionName(issue data.Issue) string {
+	name := WindowName(issue.ID)
+	label := cleanLabel(issue.Title)
+	if label == "" {
+		label = cleanLabel(string(issue.IssueType))
+	}
+	room := sessionNameMax - utf8.RuneCountInString(name) - utf8.RuneCountInString(sessionNameSep)
+	if label == "" || room < 4 {
+		return name
+	}
+	return name + sessionNameSep + truncateLabel(label, room)
+}
+
+// cleanLabel makes issue text safe to show as one line of a session list:
+// control characters (newlines, tabs, escape sequences) become spaces,
+// invisible formatting characters are dropped, and runs of space collapse.
+func cleanLabel(s string) string {
+	s = strings.Map(func(r rune) rune {
+		switch {
+		case unicode.IsControl(r):
+			return ' '
+		case unicode.Is(unicode.Cf, r):
+			return -1
+		}
+		return r
+	}, s)
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// truncateLabel cuts s to at most n runes, marking the cut with an ellipsis.
+// The cut ends on a whole word unless that would give up more than half the
+// room.
+func truncateLabel(s string, n int) string {
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	cut := runes[:n-1]
+	if !unicode.IsSpace(runes[n-1]) {
+		for i := len(cut) - 1; i >= len(cut)/2; i-- {
+			if unicode.IsSpace(cut[i]) {
+				cut = cut[:i]
+				break
+			}
+		}
+	}
+	return strings.TrimRightFunc(string(cut), unicode.IsSpace) + "…"
+}
+
+// sessionPalette is the set of colors the agent view can draw a session in:
+// the names Claude Code's /color command takes.
+var sessionPalette = []string{"red", "blue", "green", "yellow", "purple", "orange", "pink", "cyan"}
+
+// SessionColor returns the color a background session for an issue of type t
+// is drawn in. It follows the type, so the agent view shows at a glance what
+// kind of work each session is on; the name tells sessions of one type apart.
+//
+// A type mg does not know (beads allows custom ones) gets a color derived
+// from its name, so every issue of that type still shares one. An empty type
+// gets none, and the session keeps the view's default.
+func SessionColor(t data.IssueType) string {
+	switch t {
+	case data.TypeBug:
+		return "red"
+	case data.TypeFeature:
+		return "green"
+	case data.TypeTask:
+		return "blue"
+	case data.TypeEpic:
+		return "purple"
+	case data.TypeChore:
+		return "yellow"
+	case data.TypeSpike:
+		return "orange"
+	case data.TypeStory:
+		return "cyan"
+	case data.TypeMilestone:
+		return "pink"
+	case "":
+		return ""
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(t))
+	return sessionPalette[h.Sum32()%uint32(len(sessionPalette))]
+}
+
+// claudeJobsDir is where Claude Code keeps each background session's state,
+// one directory per short session ID.
+func claudeJobsDir() (string, error) {
+	if dir := os.Getenv("CLAUDE_CONFIG_DIR"); dir != "" {
+		return filepath.Join(dir, "jobs"), nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".claude", "jobs"), nil
+}
+
+// setSessionColor colors a background session in the agent view.
+//
+// Claude Code has no flag or subcommand for it. The view draws each session
+// in the `color` recorded in the session's state file, which /color writes
+// from inside the session; mg writes the same field from outside, once,
+// after the claim. The field survives the daemon's own rewrites of the file.
+// The file is replaced whole (a temp file renamed over it), so a concurrent
+// reader never sees it half-written, and it is never created: a session
+// whose state file is missing is left alone.
+func setSessionColor(sessionID, color string) error {
+	if sessionID == "" || sessionID != filepath.Base(sessionID) || sessionID == "." || sessionID == ".." {
+		return fmt.Errorf("session id %q is not a job directory name", sessionID)
+	}
+	jobs, err := claudeJobsDir()
+	if err != nil {
+		return err
+	}
+	dir := filepath.Join(jobs, sessionID)
+	path := filepath.Join(dir, "state.json")
+	raw, err := os.ReadFile(path) //nolint:gosec // path is the jobs dir plus a single-segment session id, checked above
+	if err != nil {
+		return err
+	}
+	var state map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &state); err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	if state == nil {
+		return fmt.Errorf("%s: not a JSON object", path)
+	}
+	for field, value := range map[string]string{
+		"color":     color,
+		"updatedAt": time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
+	} {
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return err
+		}
+		state[field] = encoded
+	}
+
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(state); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".state.*")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.Remove(tmp.Name()) }()
+	if _, err := tmp.Write(buf.Bytes()); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
+}
+
+// LaunchBackground starts issue's agent as a daemon-hosted background
 // session, and returns it once the daemon has registered it.
 //
 // The prompt and the flags are the launcher's, as on every other path: the
@@ -158,8 +343,9 @@ func runtimeBinary(rt Runtime) (string, error) {
 // It fails closed. A launch that reports success but leaves no session in the
 // registry is an error, not a silently absent agent: the session id is the
 // only handle attach and stop have, so an unregistered session cannot be
-// managed at all.
-func LaunchBackground(prompt, projectDir, issueID string) (BackgroundSession, error) {
+// managed at all. Coloring the session is cosmetic, so a color that cannot be
+// set leaves the launch successful.
+func LaunchBackground(prompt, projectDir string, issue data.Issue) (BackgroundSession, error) {
 	if !BackgroundSupported() {
 		rt := DetectRuntime()
 		if rt == "" {
@@ -175,8 +361,9 @@ func LaunchBackground(prompt, projectDir, issueID string) (BackgroundSession, er
 	}
 
 	// The name is the only thing tying a session back to an issue, so it
-	// follows the same convention as a tmux pane: mg-<issueID>.
-	name := WindowName(issueID)
+	// starts the way a tmux pane's does, mg-<issueID>; the scope label after
+	// it is for the people reading the agent view.
+	name := SessionName(issue)
 	ctx, cancel := context.WithTimeout(context.Background(), backgroundLaunchTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, bin, "--bg", "--name", name, prompt) //nolint:gosec // bin is the resolved agent or the user's own MG_AGENT_CMD
@@ -192,12 +379,19 @@ func LaunchBackground(prompt, projectDir, issueID string) (BackgroundSession, er
 		}
 		return BackgroundSession{}, fmt.Errorf("claude --bg: %w", err)
 	}
-	return claimBackgroundSession(projectDir, issueID)
+	session, err := claimBackgroundSession(projectDir, issue.ID, name)
+	if err != nil {
+		return BackgroundSession{}, err
+	}
+	if color := SessionColor(issue.IssueType); color != "" {
+		_ = setSessionColor(session.ID, color)
+	}
+	return session, nil
 }
 
-// claimBackgroundSession finds the session a launch just created, waiting for
-// the daemon to publish it.
-func claimBackgroundSession(projectDir, issueID string) (BackgroundSession, error) {
+// claimBackgroundSession finds the session a launch named name just created
+// for issueID, waiting for the daemon to publish it.
+func claimBackgroundSession(projectDir, issueID, name string) (BackgroundSession, error) {
 	deadline := time.Now().Add(backgroundClaimTimeout)
 	for {
 		sessions, err := ListBackgroundAgents(projectDir)
@@ -208,7 +402,7 @@ func claimBackgroundSession(projectDir, issueID string) (BackgroundSession, erro
 		}
 		if time.Now().After(deadline) {
 			return BackgroundSession{}, fmt.Errorf(
-				"started %s but it never appeared in `claude agents`", WindowName(issueID))
+				"started %s but it never appeared in `claude agents`", name)
 		}
 		time.Sleep(backgroundClaimInterval)
 	}
@@ -218,10 +412,12 @@ func claimBackgroundSession(projectDir, issueID string) (BackgroundSession, erro
 // by issue ID.
 //
 // A session counts as mg's when it is daemon-hosted, its working directory is
-// projectDir, and its name carries the mg- issue prefix. That name is the only
-// link back to an issue, so a session renamed in the agent view (ctrl+r) drops
-// out of the map — mg stops showing it, and starts a fresh session for the
-// issue if asked again.
+// projectDir, and its name starts mg-<issueID> (see SessionName). Only that
+// first word is read, so a scope label that no longer matches the issue's
+// title changes nothing. The name is still the only link back to an issue, so
+// a session renamed in the agent view (ctrl+r) to something else drops out of
+// the map — mg stops showing it, and starts a fresh session for the issue if
+// asked again.
 func ListBackgroundAgents(projectDir string) (map[string]BackgroundSession, error) {
 	sessions, err := listRegistrySessions(projectDir)
 	if err != nil {
@@ -271,10 +467,16 @@ func listRegistrySessions(dir string) ([]registrySession, error) {
 }
 
 // issueFromSessionName recovers the issue ID from a session name, or reports
-// that the session is not one of mg's.
+// that the session is not one of mg's. The ID runs from the mg- prefix to the
+// first space, so a name with a scope label and a bare mg-<issueID> from
+// before labels both resolve.
 func issueFromSessionName(name string) (string, bool) {
-	issueID, ok := strings.CutPrefix(name, "mg-")
-	if !ok || issueID == "" {
+	rest, ok := strings.CutPrefix(name, "mg-")
+	if !ok {
+		return "", false
+	}
+	issueID, _, _ := strings.Cut(rest, " ")
+	if issueID == "" {
 		return "", false
 	}
 	return issueID, true

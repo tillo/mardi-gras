@@ -79,9 +79,11 @@ func (m Model) backgroundAgentCmd(issue *data.Issue) tea.Cmd {
 	}
 	deps := issue.EvaluateDependencies(m.detail.IssueMap, m.blockingTypes)
 	prompt := agent.BuildPrompt(*issue, deps, m.detail.IssueMap)
-	issueID, dir := issue.ID, m.projectDir
+	// A copy, taken now: the Cmd runs off the update loop, and the launch
+	// reads the title and type to name and color the session.
+	target, issueID, dir := *issue, issue.ID, m.projectDir
 	return func() tea.Msg {
-		session, err := agent.LaunchBackground(prompt, dir, issueID)
+		session, err := agent.LaunchBackground(prompt, dir, target)
 		if err != nil {
 			return agentLaunchErrorMsg{issueID: issueID, err: err}
 		}
